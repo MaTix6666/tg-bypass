@@ -1,7 +1,9 @@
 """
 Сниффер трафика на базе WinDivert
 """
-
+from src.logger import logger
+from src.config import SNIFFER
+from src.rst_filter import RSTFilter
 import sys
 import signal
 from typing import Callable, Optional
@@ -25,9 +27,16 @@ class TrafficSniffer:
         self.running = False
         self.w = None
         
-        # ИСПРАВЛЕННЫЙ ФИЛЬТР WinDivertpython -m src.main -vpython -m src.main -v
-        # Перехватываем все порты где может быть Telegram
-        self.filter_str = "tcp.DstPort == 443 or tcp.DstPort == 80 or tcp.DstPort == 8080"
+        self.rst_filter = RSTFilter()
+
+        self.filter_str = SNIFFER.get_filter()
+
+        # Генерируем фильтр для TCP и UDP
+        tcp_filter = " or ".join([f"tcp.DstPort == {p}" for p in SNIFFER.TCP_PORTS])
+        udp_filter = " or ".join([f"udp.DstPort == {p}" for p in SNIFFER.UDP_PORTS])
+        self.filter_str = f"({tcp_filter}) or ({udp_filter})"
+        
+        logger.info(f"Filter: TCP[{len(SNIFFER.TCP_PORTS)} ports] + UDP[{len(SNIFFER.UDP_PORTS)} ports]")
         
         self.stats = {
             "total": 0,
@@ -38,67 +47,106 @@ class TrafficSniffer:
         
     def start(self):
         """Запускает сниффер"""
-        print(f"[*] Starting sniffer on port {self.port}...")
-        print(f"[*] Filter: {self.filter_str}")
-        print(f"[*] Press Ctrl+C to stop\n")
-        
+        logger.info(f"Starting sniffer on port {self.port}...")
+        logger.debug(f"Filter: {self.filter_str}")
+        logger.info("Press Ctrl+C to stop\n")
+
         self.running = True
-        signal.signal(signal.SIGINT, self._signal_handler)
         
+        # Сохраняем старый обработчик и устанавливаем новый
+        self._old_signal_handler = signal.signal(signal.SIGINT, self._signal_handler)
+
         try:
             with pydivert.WinDivert(self.filter_str) as self.w:
                 for packet in self.w:
                     if not self.running:
                         break
                     self._process_packet(packet)
-                    
+
         except Exception as e:
-            print(f"\n[!] Sniffer error: {e}")
+            logger.error(f"Sniffer error: {e}")
             raise
+        finally:
+            # Восстанавливаем старый обработчик
+            if hasattr(self, '_old_signal_handler'):
+                signal.signal(signal.SIGINT, self._old_signal_handler)
             
     def stop(self):
         """Останавливает сниффер"""
         self.running = False
-        print("\n[*] Stopping sniffer...")
+        logger.info("Stopping sniffer...")
         
     def _process_packet(self, packet: pydivert.Packet):
         """Обрабатывает перехваченный пакет"""
         try:
             self.stats["total"] += 1
             
-            # Безопасная проверка payload
-            payload = None
-            try:
-                payload = packet.tcp.payload
-            except:
-                pass
+            # === ОБРАБОТКА TCP ===
+            if hasattr(packet, 'tcp'):
+                # Блокируем фейковые RST
+                if self.rst_filter.should_drop(packet):
+                    return
                 
-            if not payload:
-                self._forward(packet)
-                return
-                
-            # Анализируем TLS
-            sni = None
-            is_telegram = False
-            
-            if len(payload) > 5 and payload[0] == 0x16:
-                self.stats["tls"] += 1
-                sni = get_sni_from_payload(payload)
-                
-                if sni and "telegram" in sni.lower():
-                    is_telegram = True
-                    self.stats["telegram"] += 1
+                # Обрабатываем TCP payload
+                payload = None
+                try:
+                    payload = packet.tcp.payload
+                except:
+                    pass
                     
-            # Вызываем callback если есть
-            if self.on_packet:
-                result = self.on_packet(packet, sni, is_telegram, self.w)
-                if result is False:
+                if not payload:
+                    self._forward(packet)
                     return
                     
-            self._forward(packet)
+                # Анализируем TLS
+                sni = None
+                is_telegram = False
+                
+                if len(payload) > 5 and payload[0] == 0x16:
+                    self.stats["tls"] = self.stats.get("tls", 0) + 1
+                    sni = get_sni_from_payload(payload)
+                    
+                    if sni and "telegram" in sni.lower():
+                        is_telegram = True
+                        self.stats["telegram"] = self.stats.get("telegram", 0) + 1
+                        
+                # Вызываем callback
+                should_forward = True
+                if self.on_packet:
+                    try:
+                        result = self.on_packet(packet, sni, is_telegram, self.w)
+                        if result is False:
+                            should_forward = False
+                    except Exception as e:
+                        self.stats["errors"] = self.stats.get("errors", 0) + 1
+                        if self.on_error:
+                            self.on_error(e, packet)
+
+                if should_forward:
+                    self._forward(packet)
             
+            # === ОБРАБОТКА UDP (звонки) ===
+            elif hasattr(packet, 'udp'):
+                self.stats["udp"] = self.stats.get("udp", 0) + 1
+                
+                # Пока просто пропускаем UDP пакеты
+                # Потом добавим фрагментацию UDP
+                try:
+                    payload = packet.udp.payload
+                    if payload:
+                        logger.debug(f"UDP packet: {packet.dst_addr}:{packet.udp.dst_port} ({len(payload)} bytes)")
+                except:
+                    pass
+                
+                self._forward(packet)
+            
+            # === ДРУГИЕ ПРОТОКОЛЫ ===
+            else:
+                # Неизвестный протокол — просто пропускаем
+                self._forward(packet)
+                
         except Exception as e:
-            self.stats["errors"] += 1
+            self.stats["errors"] = self.stats.get("errors", 0) + 1
             if self.on_error:
                 self.on_error(e, packet)
             else:
@@ -106,6 +154,17 @@ class TrafficSniffer:
                     self._forward(packet)
                 except:
                     pass
+
+    def _process_udp(self, packet: pydivert.Packet):
+        """Обрабатывает UDP пакеты (VoIP)"""
+        try:
+            # Пока просто пропускаем все UDP пакеты
+            # Потом добавим фрагментацию
+            self.stats["udp"] = self.stats.get("udp", 0) + 1
+            self._forward(packet)
+        except Exception as e:
+            logger.debug(f"UDP processing error: {e}")
+            self._forward(packet)
                     
     def _forward(self, packet: pydivert.Packet):
         """Пропускает пакет дальше"""
@@ -114,20 +173,22 @@ class TrafficSniffer:
             
     def _signal_handler(self, signum, frame):
         """Обработчик сигнала завершения"""
+        logger.info("Получен сигнал остановки")
         self.stop()
         self._print_stats()
+        # Восстанавливаем стандартное поведение и выходим
         sys.exit(0)
         
     def _print_stats(self):
         """Выводит статистику"""
-        print("\n" + "="*50)
-        print("STATISTICS")
-        print("="*50)
-        print(f"Total packets:  {self.stats['total']}")
-        print(f"TLS packets:    {self.stats['tls']}")
-        print(f"Telegram:       {self.stats['telegram']}")
-        print(f"Errors:         {self.stats['errors']}")
-        print("="*50)
+        logger.info("=" * 50)
+        logger.info("STATISTICS")
+        logger.info("=" * 50)
+        logger.info(f"Total packets: {self.stats['total']}")
+        logger.info(f"TLS packets: {self.stats['tls']}")
+        logger.info(f"Telegram: {self.stats['telegram']}")
+        logger.info(f"Errors: {self.stats['errors']}")
+        logger.info("=" * 50)
         
     def get_stats(self) -> dict:
         """Возвращает копию статистики"""
