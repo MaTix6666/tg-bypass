@@ -2,7 +2,7 @@
 Сниффер трафика на базе WinDivert
 """
 from src.logger import logger
-from src.config import SNIFFER
+from .config import TELEGRAM, SNIFFER
 from src.rst_filter import RSTFilter
 import sys
 import signal
@@ -33,7 +33,7 @@ class TrafficSniffer:
 
         # Генерируем фильтр для TCP и UDP
         tcp_filter = " or ".join([f"tcp.DstPort == {p}" for p in SNIFFER.TCP_PORTS])
-        udp_filter = " or ".join([f"udp.DstPort == {p}" for p in SNIFFER.UDP_PORTS])
+        udp_filter = " or ".join([f"udp.DstPort == {p}" for p in TELEGRAM.UDP_PORTS])
         self.filter_str = f"({tcp_filter}) or ({udp_filter})"
         
         logger.info(f"Filter: TCP[{len(SNIFFER.TCP_PORTS)} ports] + UDP[{len(SNIFFER.UDP_PORTS)} ports]")

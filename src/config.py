@@ -116,13 +116,18 @@ class FragmentationConfig:
 
 @dataclass
 class SnifferConfig:
-    """Настройки сниффера"""
     PORTS: List[int] = None
+    TCP_PORTS: List[int] = None
+    UDP_PORTS: List[int] = None
     FILTER_TEMPLATE: str = "tcp.DstPort == {}"
-    
+
     def __post_init__(self):
         if self.PORTS is None:
             self.PORTS = [443, 80, 8080]
+        if self.TCP_PORTS is None:
+            self.TCP_PORTS = [443, 80, 8080]
+        if self.UDP_PORTS is None:
+            self.UDP_PORTS = [3478, 5349, 9350]
     
     def get_filter(self) -> str:
         """Генерирует WinDivert фильтр"""
